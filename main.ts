@@ -1,628 +1,581 @@
-// Comet Surfer — make.fun ai-excited-01 (Node 22, standard library only).
-//
-// The program paints one picture, "Comet Surfer": a lone astronaut riding
-// a burning comet on a hard diagonal across deep space, Earth tiny far
-// below, and the line "DON'T BLINK." Everything is drawn procedurally
-// into a floating-point light buffer, tone-mapped, and packed into a PNG
-// by hand (CRC32, zlib, adaptive row filters). Nothing is read from disk,
-// there is no clock and no Math.random: a single seeded generator drives
-// every random choice, so the two grader runs produce identical bytes.
-//
-// The picture is aimed at the judge's criteria, in their order:
-//   1. A jolt on first sight: a comet as big as the sky, a rider on it,
-//      a whole planet small underneath — scale contrast is the shock.
-//   2. An idea of its own: surfing a comet is a twist, not a stock
-//      explosion or a firework. The fragile rider on the unstoppable
-//      comet is the surprise.
-//   3. Motion: the diagonal runs top-right to bottom-left, the scarf
-//      streams, gold dust trails off the board, faint streaks tear
-//      parallel to the path. Everything points at the comet's head.
-//   4. Craft: the rider is a bold silhouette (no face, no anatomy to
-//      break), the comet is layered glow, the sky has depth (nebula,
-//      a milky-way band, stars of many brightnesses).
-//   5. It still lands at 300 px: one bright diagonal, one glowing head,
-//      one dark rider, one small blue Earth, one short caption.
-//
-// Run:  mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-// Out:  $MAKEFUN_OUTPUT_DIR/entry.png  (1024x1024 RGB PNG, under 1 MiB)
+// Comet Surfer — a procedural 1024x1024 PNG renderer.
+// A tiny astronaut surfs a blazing comet diagonally across deep space,
+// Earth small below, caption "DON'T BLINK." in a 5x7 bitmap font.
+// Node 22 stdlib only. Deterministic: fixed-seed PRNG, no clock, no network.
+// Usage: MAKEFUN_OUTPUT_DIR=<dir> node main.ts  (writes <dir>/entry.png)
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as zlib from 'node:zlib';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { deflateSync } from 'node:zlib';
 
-const SIZE = 1024;
-
-type RGB = [number, number, number];
+const W = 1024;
+const H = 1024;
 
 // ---------------------------------------------------------------------------
-// Seeded randomness. mulberry32, wrapped so the scene can ask for a value
-// in a range. One fixed seed keeps the output deterministic.
+// Deterministic PRNG (mulberry32, fixed seed)
 // ---------------------------------------------------------------------------
-class Rng {
-  private state: number;
-  constructor(seed: number) {
-    this.state = seed >>> 0;
-  }
-  next(): number {
-    let a = (this.state = (this.state + 0x6d2b79f5) | 0);
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  }
-  inRange(lo: number, hi: number): number {
-    return lo + this.next() * (hi - lo);
-  }
+  };
 }
-const rng = new Rng(20261116);
+const rand = mulberry32(20261116);
 
 // ---------------------------------------------------------------------------
-// The picture lives in a float buffer: scene-linear light, roughly 0..3.
-// Drawing is additive, because that is how glow behaves — light piles up.
+// Float light buffer: three floats per pixel, additive light accumulates here.
 // ---------------------------------------------------------------------------
-class Canvas {
-  readonly px = new Float32Array(SIZE * SIZE * 3);
+const buf = new Float32Array(W * H * 3);
 
-  private offset(x: number, y: number): number {
-    return (y * SIZE + x) * 3;
-  }
-  private inside(x: number, y: number): boolean {
-    return x >= 0 && y >= 0 && x < SIZE && y < SIZE;
-  }
-
-  add(x: number, y: number, c: RGB): void {
-    const xi = Math.floor(x);
-    const yi = Math.floor(y);
-    if (!this.inside(xi, yi)) return;
-    const i = this.offset(xi, yi);
-    this.px[i] += c[0];
-    this.px[i + 1] += c[1];
-    this.px[i + 2] += c[2];
-  }
-
-  set(x: number, y: number, c: RGB): void {
-    const xi = Math.floor(x);
-    const yi = Math.floor(y);
-    if (!this.inside(xi, yi)) return;
-    const i = this.offset(xi, yi);
-    this.px[i] = c[0];
-    this.px[i + 1] = c[1];
-    this.px[i + 2] = c[2];
-  }
-
-  // A soft round glow: gaussian-style falloff, additive. `tight` sharpens
-  // the falloff; larger values make a harder-edged light.
-  halo(cx: number, cy: number, radius: number, c: RGB, tight = 3): void {
-    const x0 = Math.max(0, Math.floor(cx - radius));
-    const x1 = Math.min(SIZE - 1, Math.ceil(cx + radius));
-    const y0 = Math.max(0, Math.floor(cy - radius));
-    const y1 = Math.min(SIZE - 1, Math.ceil(cy + radius));
-    const inv = 1 / radius;
-    for (let y = y0; y <= y1; y++) {
-      const ny = (y - cy) * inv;
-      const ny2 = ny * ny;
-      for (let x = x0; x <= x1; x++) {
-        const nx = (x - cx) * inv;
-        const q = nx * nx + ny2;
-        if (q > 4) continue;
-        const f = Math.exp(-q * tight);
-        if (f < 0.004) continue;
-        const i = this.offset(x, y);
-        this.px[i] += c[0] * f;
-        this.px[i + 1] += c[1] * f;
-        this.px[i + 2] += c[2] * f;
-      }
-    }
-  }
-
-  // A solid filled circle: every pixel inside gets the colour outright.
-  blob(cx: number, cy: number, radius: number, c: RGB): void {
-    const x0 = Math.max(0, Math.floor(cx - radius));
-    const x1 = Math.min(SIZE - 1, Math.ceil(cx + radius));
-    const y0 = Math.max(0, Math.floor(cy - radius));
-    const y1 = Math.min(SIZE - 1, Math.ceil(cy + radius));
-    const r2 = radius * radius;
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
-        const dx = x - cx;
-        const dy = y - cy;
-        if (dx * dx + dy * dy <= r2) this.set(x, y, c);
-      }
-    }
-  }
-
-  // A thick segment between two points, built by stamping discs along it.
-  // Solid stamps draw a shape; glow stamps draw a streak of light.
-  stroke(x0: number, y0: number, x1: number, y1: number, width: number, c: RGB, solid: boolean): void {
-    const dx = x1 - x0;
-    const dy = y1 - y0;
-    const len = Math.hypot(dx, dy);
-    const steps = Math.max(1, Math.ceil(len / (width * 0.45)));
-    for (let s = 0; s <= steps; s++) {
-      const t = s / steps;
-      const cx = x0 + dx * t;
-      const cy = y0 + dy * t;
-      if (solid) this.blob(cx, cy, width / 2, c);
-      else this.halo(cx, cy, width * 0.8, c, 4);
-    }
-  }
+function put(x, y, r, g, b) {
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const i = (y * W + x) * 3;
+  buf[i] += r;
+  buf[i + 1] += g;
+  buf[i + 2] += b;
 }
 
-const img = new Canvas();
-
-function clamp01(v: number): number {
-  return v < 0 ? 0 : v > 1 ? 1 : v;
+function setPx(x, y, r, g, b) {
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const i = (y * W + x) * 3;
+  buf[i] = r;
+  buf[i + 1] = g;
+  buf[i + 2] = b;
 }
 
-// ---------------------------------------------------------------------------
-// PNG writer (truecolour RGB, 8-bit, non-interlaced), standard library only.
-// Each row is tried under all five filters and the one whose bytes sum
-// smallest in magnitude wins; the raw scanlines are zlib-compressed at
-// level 9. Identical pixels always encode to identical bytes.
-// ---------------------------------------------------------------------------
-function buildCrcTable(): Uint32Array {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) {
-      c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    table[n] = c >>> 0;
-  }
-  return table;
-}
-const CRC_TABLE = buildCrcTable();
-
-function crc32(bytes: Uint8Array): number {
-  let c = 0xffffffff;
-  for (const byte of bytes) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-
-function pngChunk(kind: string, payload: Uint8Array): Buffer {
-  const out = Buffer.alloc(12 + payload.length);
-  out.writeUInt32BE(payload.length, 0);
-  out.write(kind, 4, 'ascii');
-  out.set(payload, 8);
-  const forCrc = Buffer.concat([Buffer.from(kind, 'ascii'), Buffer.from(payload)]);
-  out.writeUInt32BE(crc32(forCrc), 8 + payload.length);
-  return out;
-}
-
-function paethPredictor(left: number, up: number, upLeft: number): number {
-  const p = left + up - upLeft;
-  const pa = Math.abs(p - left);
-  const pb = Math.abs(p - up);
-  const pc = Math.abs(p - upLeft);
-  if (pa <= pb && pa <= pc) return left;
-  if (pb <= pc) return up;
-  return upLeft;
-}
-
-// Filters one scanline under one filter type into `out`, returning the
-// score (sum of |signed byte|) the encoder minimises.
-function filterScanline(row: Uint8Array, prev: Uint8Array, filter: number, out: Uint8Array): number {
-  let score = 0;
-  for (let x = 0; x < row.length; x++) {
-    const left = x >= 3 ? row[x - 3] : 0;
-    const up = prev[x];
-    const upLeft = x >= 3 ? prev[x - 3] : 0;
-    let filtered: number;
-    switch (filter) {
-      case 0:
-        filtered = row[x];
-        break;
-      case 1:
-        filtered = row[x] - left;
-        break;
-      case 2:
-        filtered = row[x] - up;
-        break;
-      case 3:
-        filtered = row[x] - ((left + up) >> 1);
-        break;
-      default:
-        filtered = row[x] - paethPredictor(left, up, upLeft);
-    }
-    const byte = filtered & 0xff;
-    out[x] = byte;
-    score += byte < 128 ? byte : 256 - byte;
-  }
-  return score;
-}
-
-function toPng(rgb: Uint8Array): Buffer {
-  const stride = SIZE * 3;
-  const raw = Buffer.alloc(SIZE * (stride + 1));
-  const prev = new Uint8Array(stride);
-  const tries = [
-    new Uint8Array(stride),
-    new Uint8Array(stride),
-    new Uint8Array(stride),
-    new Uint8Array(stride),
-    new Uint8Array(stride),
-  ];
-  for (let y = 0; y < SIZE; y++) {
-    const row = rgb.subarray(y * stride, (y + 1) * stride);
-    let bestFilter = 0;
-    let bestScore = Infinity;
-    for (let f = 0; f < 5; f++) {
-      const score = filterScanline(row, prev, f, tries[f]);
-      if (score < bestScore) {
-        bestScore = score;
-        bestFilter = f;
-      }
-    }
-    const dst = y * (stride + 1);
-    raw[dst] = bestFilter;
-    raw.set(tries[bestFilter], dst + 1);
-    prev.set(row);
-  }
-  const header = Buffer.alloc(13);
-  header.writeUInt32BE(SIZE, 0);
-  header.writeUInt32BE(SIZE, 4);
-  header[8] = 8; // bit depth
-  header[9] = 2; // colour type 2 = RGB
-  header[10] = 0; // compression method
-  header[11] = 0; // filter method
-  header[12] = 0; // interlace: none
-  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  const compressed = zlib.deflateSync(raw, { level: 9 });
-  return Buffer.concat([
-    signature,
-    pngChunk('IHDR', header),
-    pngChunk('IDAT', compressed),
-    pngChunk('IEND', new Uint8Array(0)),
-  ]);
-}
-
-// ---------------------------------------------------------------------------
-// SKY: a deep-space gradient, a few faint nebula clouds, a diagonal
-// milky-way band of dense dim stars, and single stars of many magnitudes.
-// ---------------------------------------------------------------------------
-function paintSky(): void {
-  for (let y = 0; y < SIZE; y++) {
-    const t = y / (SIZE - 1);
-    // Near-black indigo up top, a breath of violet down below so the
-    // lower half is not a dead void.
-    const c: RGB = [0.012 + 0.02 * t, 0.014 + 0.018 * t, 0.045 + 0.05 * t];
-    for (let x = 0; x < SIZE; x++) img.set(x, y, c);
-  }
-
-  // Nebula clouds: huge, very soft, tinted. They give the sky depth while
-  // the comet keeps all the colour to itself.
-  const clouds: Array<{ x: number; y: number; rad: number; c: RGB }> = [
-    { x: 200, y: 250, rad: 390, c: [0.055, 0.033, 0.121] },
-    { x: 850, y: 830, rad: 430, c: [0.02, 0.06, 0.08] },
-    { x: 790, y: 150, rad: 310, c: [0.064, 0.02, 0.048] },
-    { x: 130, y: 750, rad: 330, c: [0.0225, 0.036, 0.09] },
-  ];
-  for (const cloud of clouds) img.halo(cloud.x, cloud.y, cloud.rad, cloud.c, 1.6);
-
-  // Milky-way band: a diagonal strip of dense faint stars, upper-left to
-  // lower-right. It hands the sky a direction of its own.
-  const ang = Math.PI / 4;
-  const ca = Math.cos(ang);
-  const sa = Math.sin(ang);
-  for (let i = 0; i < 500; i++) {
-    const along = rng.inRange(-260, 1240);
-    const across = (rng.next() + rng.next() + rng.next() - 1.5) * 130;
-    const x = 512 + along * ca - across * sa;
-    const y = 512 + along * sa + across * ca;
-    const m = 0.02 + rng.next() * rng.next() * 0.1;
-    const warm = rng.next();
-    img.add(x, y, [m * (0.8 + warm * 0.4), m * 0.85, m * (1.1 - warm * 0.3)]);
-    if (rng.next() < 0.25) img.add(x + 1, y, [m * 0.25, m * 0.2125, m * 0.275]);
-  }
-
-  // Single stars: steep magnitude spread — many dim, a few bright. The
-  // brightest ones get a small diffraction cross.
-  for (let i = 0; i < 640; i++) {
-    const x = rng.next() * SIZE;
-    const y = rng.next() * SIZE;
-    const mag = 0.03 + Math.pow(rng.next(), 3.2) * 0.85;
-    const warm = rng.next();
-    const c: RGB = [mag * (0.85 + warm * 0.35), mag * 0.9, mag * (1.15 - warm * 0.35)];
-    img.add(x, y, c);
-    if (mag <= 0.35) continue;
-    const arm = 2 + Math.floor(rng.next() * 4);
-    for (let d = 1; d <= arm; d++) {
-      const f = mag * 0.28 * (1 - d / (arm + 1));
-      img.add(x + d, y, [f, f * 0.9, f]);
-      img.add(x - d, y, [f, f * 0.9, f]);
-      img.add(x, y + d, [f, f * 0.9, f]);
-      img.add(x, y - d, [f, f * 0.9, f]);
-    }
-    img.add(x + 1, y, [mag * 0.45, mag * 0.45, mag * 0.5]);
-    img.add(x, y + 1, [mag * 0.45, mag * 0.45, mag * 0.5]);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// COMET. The head sits at (655, 335); the tail sweeps up to the top-right
-// corner, and the comet travels down-left. The tail axis is an angle, not
-// a pair of magic numbers: -0.66 rad points up-right at about 38 degrees.
-// ---------------------------------------------------------------------------
-const COMET_HEAD = { x: 655, y: 335 };
-const TAIL_ANGLE = -0.66;
-const TAIL_LEN = 460;
-const TAIL_UX = Math.cos(TAIL_ANGLE);
-const TAIL_UY = Math.sin(TAIL_ANGLE);
-// Travel direction is the tail's opposite: down-left.
-const TRAVEL_X = -TAIL_UX;
-const TRAVEL_Y = -TAIL_UY;
-
-function paintComet(): void {
-  // Tail: overlapping discs along the axis, tapering and cooling from
-  // white-gold at the head to deep red at the tip, with a gentle sine
-  // wobble so it feels alive rather than ruled. Each disc also carries
-  // a narrower, whiter core so the tail has a spine.
-  for (let i = 0; i < 128; i++) {
-    const t = i / 127;
-    const along = t * TAIL_LEN;
-    const wob = Math.sin(t * 9 + 1.25) * 12 * t;
-    const cx = COMET_HEAD.x + TAIL_UX * along - TAIL_UY * wob;
-    const cy = COMET_HEAD.y + TAIL_UY * along + TAIL_UX * wob;
-    const rad = 92 * Math.pow(1 - t, 0.8) + 5;
-    const inten = 1.15 * (1 - t * 0.92);
-    const c: RGB = [inten * (1 - 0.25 * t), inten * (0.62 - 0.42 * t), inten * (0.22 - 0.18 * t)];
-    img.halo(cx, cy, rad, c, 2.6);
-    img.halo(cx, cy, rad * 0.34, [c[0] * 1.5, c[1] * 1.35, c[2] * 1.1], 3.2);
-  }
-
-  // Head: stacked glows — white core, gold, orange, wide red halo — plus
-  // two off-centre puffs so it is not a perfect ball.
-  img.halo(COMET_HEAD.x, COMET_HEAD.y, 26, [2.6, 2.3, 1.9], 2.4);
-  img.halo(COMET_HEAD.x, COMET_HEAD.y, 58, [1.5, 0.95, 0.4], 2.6);
-  img.halo(COMET_HEAD.x, COMET_HEAD.y, 115, [0.85, 0.42, 0.12], 2.8);
-  img.halo(COMET_HEAD.x, COMET_HEAD.y, 215, [0.38, 0.14, 0.04], 3.0);
-  img.halo(COMET_HEAD.x - 34, COMET_HEAD.y + 26, 46, [0.7, 0.38, 0.12], 2.6);
-  img.halo(COMET_HEAD.x + 18, COMET_HEAD.y - 42, 38, [0.6, 0.34, 0.12], 2.6);
-
-  // Sparks: bright embers flung off the head, drifting down-left.
-  for (let i = 0; i < 44; i++) {
-    const a = rng.next() * Math.PI * 2;
-    const d = 30 + rng.next() * rng.next() * 190;
-    const x = COMET_HEAD.x + Math.cos(a) * d * 0.9 - rng.next() * 60;
-    const y = COMET_HEAD.y + Math.sin(a) * d * 0.9 + rng.next() * 60;
-    const m = 0.25 + rng.next() * 0.9;
-    const warm = 0.5 + rng.next() * 0.5;
-    img.add(x, y, [m, m * (0.55 + warm * 0.2), m * 0.25]);
-    if (rng.next() < 0.4) img.add(x + 1, y, [m * 0.5, m * 0.3, m * 0.12]);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// EARTH: small and far below, so the comet's scale reads. Lit from the
-// top-right — the comet is the light source — and falling away to night
-// on the bottom-left.
-// ---------------------------------------------------------------------------
-const EARTH = { x: 150, y: 862, r: 92 };
-
-function earthLit(dx: number, dy: number): number {
-  // 1 on the top-right edge, about 0.12 on the bottom-left.
-  return clamp01(0.55 + (dx - dy) / (EARTH.r * 2.4));
-}
-
-function paintEarth(): void {
-  // Atmosphere: a cyan-blue halo, stronger on the lit side.
-  img.halo(EARTH.x, EARTH.y, EARTH.r + 26, [0.1, 0.28, 0.5], 2.2);
-  img.halo(EARTH.x + 26, EARTH.y - 26, EARTH.r + 10, [0.22, 0.42, 0.72], 2.4);
-  // Ocean: base blue, brighter where the comet's light hits.
-  const x0 = Math.max(0, Math.floor(EARTH.x - EARTH.r));
-  const x1 = Math.min(SIZE - 1, Math.ceil(EARTH.x + EARTH.r));
-  const y0 = Math.max(0, Math.floor(EARTH.y - EARTH.r));
-  const y1 = Math.min(SIZE - 1, Math.ceil(EARTH.y + EARTH.r));
+// Soft radial glow: peak brightness at the centre, smooth falloff to radius.
+function glow(cx, cy, radius, r, g, b, peak) {
+  const x0 = Math.max(0, Math.floor(cx - radius));
+  const x1 = Math.min(W - 1, Math.ceil(cx + radius));
+  const y0 = Math.max(0, Math.floor(cy - radius));
+  const y1 = Math.min(H - 1, Math.ceil(cy + radius));
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
-      const dx = x - EARTH.x;
-      const dy = y - EARTH.y;
-      if (dx * dx + dy * dy > EARTH.r * EARTH.r) continue;
-      const ocean = 0.1 + 0.55 * earthLit(dx, dy);
-      img.set(x, y, [ocean * 0.35, ocean * 0.75, ocean * 1.35]);
+      const dx = (x - cx) / radius;
+      const dy = (y - cy) / radius;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= 1) continue;
+      const f = peak * (1 - d2) * (1 - d2);
+      put(x, y, r * f, g * f, b * f);
     }
   }
-  // Clouds: a few soft white wisps, brighter on the lit side.
-  for (let i = 0; i < 6; i++) {
-    const a = rng.next() * Math.PI * 2;
-    const d = rng.next() * EARTH.r * 0.62;
-    const cx = EARTH.x + Math.cos(a) * d;
-    const cy = EARTH.y + Math.sin(a) * d;
-    const lit = earthLit(cx - EARTH.x, cy - EARTH.y);
-    img.halo(cx, cy, 10 + rng.next() * 14, [0.22 * lit + 0.02, 0.24 * lit + 0.02, 0.28 * lit + 0.03], 2.2);
+}
+
+// Hard disc with a 1px antialiased rim.
+function disc(cx, cy, radius, r, g, b) {
+  const x0 = Math.max(0, Math.floor(cx - radius - 1));
+  const x1 = Math.min(W - 1, Math.ceil(cx + radius + 1));
+  const y0 = Math.max(0, Math.floor(cy - radius - 1));
+  const y1 = Math.min(H - 1, Math.ceil(cy + radius + 1));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy) - radius;
+      if (d >= 1) continue;
+      const a = d <= 0 ? 1 : 1 - d;
+      const i = (y * W + x) * 3;
+      buf[i] = buf[i] * (1 - a) + r * a;
+      buf[i + 1] = buf[i + 1] * (1 - a) + g * a;
+      buf[i + 2] = buf[i + 2] * (1 - a) + b * a;
+    }
   }
-  // Bright crescent rim on the lit edge.
-  for (let a = -0.9; a <= 0.9; a += 0.06) {
-    const px = EARTH.x + Math.cos(a + Math.PI * 0.25) * (EARTH.r - 1);
-    const py = EARTH.y + Math.sin(a + Math.PI * 0.25) * (EARTH.r - 1);
-    img.add(px, py, [0.5, 0.7, 1.0]);
+}
+
+// Thick line segment (capsule) drawn additively.
+function stroke(x0, y0, x1, y1, width, r, g, b, peak) {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const len2 = dx * dx + dy * dy;
+  const rad = width / 2 + 1;
+  const bx0 = Math.max(0, Math.floor(Math.min(x0, x1) - rad));
+  const bx1 = Math.min(W - 1, Math.ceil(Math.max(x0, x1) + rad));
+  const by0 = Math.max(0, Math.floor(Math.min(y0, y1) - rad));
+  const by1 = Math.min(H - 1, Math.ceil(Math.max(y0, y1) + rad));
+  for (let y = by0; y <= by1; y++) {
+    for (let x = bx0; x <= bx1; x++) {
+      const px = x + 0.5;
+      const py = y + 0.5;
+      let t = len2 === 0 ? 0 : ((px - x0) * dx + (py - y0) * dy) / len2;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const d = Math.hypot(px - (x0 + t * dx), py - (y0 + t * dy));
+      if (d >= rad) continue;
+      const f = peak * (1 - (d / rad) * (d / rad));
+      put(x, y, r * f, g * f, b * f);
+    }
+  }
+}
+
+// Thick line segment (capsule) that OVERWRITES with a flat colour.
+// Additive strokes cannot draw a dark silhouette (adding near-black adds
+// nothing), so limbs are painted with this instead.
+function strokeSolid(x0, y0, x1, y1, width, r, g, b) {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const len2 = dx * dx + dy * dy;
+  const rad = width / 2 + 1;
+  const bx0 = Math.max(0, Math.floor(Math.min(x0, x1) - rad));
+  const bx1 = Math.min(W - 1, Math.ceil(Math.max(x0, x1) + rad));
+  const by0 = Math.max(0, Math.floor(Math.min(y0, y1) - rad));
+  const by1 = Math.min(H - 1, Math.ceil(Math.max(y0, y1) + rad));
+  for (let y = by0; y <= by1; y++) {
+    for (let x = bx0; x <= bx1; x++) {
+      const px = x + 0.5;
+      const py = y + 0.5;
+      let t = len2 === 0 ? 0 : ((px - x0) * dx + (py - y0) * dy) / len2;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const d = Math.hypot(px - (x0 + t * dx), py - (y0 + t * dy));
+      if (d >= rad) continue;
+      const a = d <= rad - 1 ? 1 : 1 - (d - (rad - 1));
+      const i = (y * W + x) * 3;
+      buf[i] = buf[i] * (1 - a) + r * a;
+      buf[i + 1] = buf[i + 1] * (1 - a) + g * a;
+      buf[i + 2] = buf[i + 2] * (1 - a) + b * a;
+    }
+  }
+}
+
+// Filled polygon (scanline), overwriting with a flat colour.
+function fillPoly(points, r, g, b) {
+  let minY = H;
+  let maxY = 0;
+  for (const p of points) {
+    if (p[1] < minY) minY = p[1];
+    if (p[1] > maxY) maxY = p[1];
+  }
+  minY = Math.max(0, Math.floor(minY));
+  maxY = Math.min(H - 1, Math.ceil(maxY));
+  const n = points.length;
+  for (let y = minY; y <= maxY; y++) {
+    const xs = [];
+    for (let i = 0; i < n; i++) {
+      const a = points[i];
+      const c = points[(i + 1) % n];
+      if ((a[1] <= y && c[1] > y) || (c[1] <= y && a[1] > y)) {
+        const t = (y + 0.5 - a[1]) / (c[1] - a[1]);
+        xs.push(a[0] + t * (c[0] - a[0]));
+      }
+    }
+    xs.sort((p, q) => p - q);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const x0 = Math.max(0, Math.ceil(xs[k]));
+      const x1 = Math.min(W - 1, Math.floor(xs[k + 1]));
+      for (let x = x0; x <= x1; x++) setPx(x, y, r, g, b);
+    }
+  }
+}
+
+// Filled ellipse with a soft edge, overwriting.
+function softEllipse(cx, cy, rx, ry, r, g, b, alpha) {
+  const x0 = Math.max(0, Math.floor(cx - rx - 1));
+  const x1 = Math.min(W - 1, Math.ceil(cx + rx + 1));
+  const y0 = Math.max(0, Math.floor(cy - ry - 1));
+  const y1 = Math.min(H - 1, Math.ceil(cy + ry + 1));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dx = (x + 0.5 - cx) / rx;
+      const dy = (y + 0.5 - cy) / ry;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d >= 1) continue;
+      const a = alpha * (d < 0.85 ? 1 : 1 - (d - 0.85) / 0.15);
+      const i = (y * W + x) * 3;
+      buf[i] = buf[i] * (1 - a) + r * a;
+      buf[i + 1] = buf[i + 1] * (1 - a) + g * a;
+      buf[i + 2] = buf[i + 2] * (1 - a) + b * a;
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
-// MOTION STREAKS: faint lines parallel to the comet's path, so the whole
-// frame feels like it is tearing down-left.
+// Sky: vertical gradient, nebula blobs, milky-way band, starfield.
 // ---------------------------------------------------------------------------
-function paintStreaks(): void {
-  const streaks: Array<{ x: number; y: number; len: number; a: number }> = [
-    { x: 420, y: 170, len: 200, a: 0.15 },
-    { x: 530, y: 110, len: 150, a: 0.11 },
-    { x: 320, y: 340, len: 250, a: 0.13 },
-    { x: 770, y: 530, len: 180, a: 0.09 },
-    { x: 240, y: 490, len: 170, a: 0.1 },
+function paintSky() {
+  for (let y = 0; y < H; y++) {
+    const t = y / (H - 1);
+    const r = 0.035 + 0.02 * t;
+    const g = 0.03 + 0.015 * t;
+    const b = 0.10 + 0.05 * (1 - t);
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 3;
+      buf[i] = r;
+      buf[i + 1] = g;
+      buf[i + 2] = b;
+    }
+  }
+  // Nebula: huge, faint, coloured clouds.
+  glow(210, 190, 320, 0.30, 0.12, 0.55, 0.10);
+  glow(880, 720, 360, 0.05, 0.35, 0.40, 0.09);
+  glow(520, 470, 300, 0.45, 0.10, 0.35, 0.06);
+  glow(120, 620, 260, 0.12, 0.12, 0.45, 0.08);
+  glow(760, 120, 220, 0.50, 0.25, 0.10, 0.05);
+
+  // Milky-way band: diagonal strip of faint glow + dense dim stars.
+  const bandX = -0.55;
+  const bandY = 0.835;
+  for (let i = 0; i < 520; i++) {
+    const s = rand();
+    const x = rand() * W;
+    const y = 700 - x * 0.55 + (rand() - 0.5) * 190;
+    if (y < 0 || y >= H) continue;
+    const bright = 0.10 + rand() * 0.35;
+    put(Math.floor(x), Math.floor(y), bright * 0.8, bright * 0.85, bright);
+  }
+  glow(300, 480, 260, 0.45, 0.5, 0.75, 0.05);
+  glow(650, 300, 220, 0.4, 0.45, 0.7, 0.04);
+
+  // Starfield.
+  for (let i = 0; i < 720; i++) {
+    const x = Math.floor(rand() * W);
+    const y = Math.floor(rand() * H);
+    const m = rand();
+    const bright = 0.25 + m * m * 0.75;
+    const warm = rand();
+    const r = bright * (warm > 0.7 ? 1.0 : 0.85);
+    const g = bright * 0.88;
+    const b = bright * (warm < 0.3 ? 1.0 : 0.9);
+    put(x, y, r, g, b);
+    if (m > 0.97) {
+      // Cross sparkle on the very brightest stars only.
+      stroke(x - 3, y, x + 3, y, 1, r, g, b, 0.35);
+      stroke(x, y - 3, x, y + 3, 1, r, g, b, 0.35);
+    }
+  }
+
+  // Two shooting stars, thin diagonal streaks.
+  stroke(150, 300, 320, 430, 2, 0.9, 0.95, 1.0, 0.55);
+  stroke(700, 640, 830, 760, 2, 0.9, 0.9, 1.0, 0.45);
+  glow(150, 300, 8, 0.9, 0.95, 1.0, 0.7);
+  glow(700, 640, 7, 0.9, 0.9, 1.0, 0.6);
+}
+
+// ---------------------------------------------------------------------------
+// Comet: head at (775, 235), tail streaming down-left along a diagonal.
+// ---------------------------------------------------------------------------
+const COMET_HEAD = [775, 235];
+const COMET_DIR = [-0.832, 0.555]; // unit vector, head -> tail
+
+function paintComet() {
+  const [hx, hy] = COMET_HEAD;
+  const [dx, dy] = COMET_DIR;
+  // Tail: a chain of widening, fading glows; the tail bends slightly.
+  // Two layers: a wide faint envelope and a hotter inner body, so the tail
+  // reads as fire, not a laser beam.
+  for (let s = 0; s <= 44; s++) {
+    const t = s / 44;
+    const bend = 38 * t * t; // tail curves downward
+    const cx = hx + dx * 700 * t + bend * 0.25;
+    const cy = hy + dy * 700 * t + bend;
+    const radius = 34 + 200 * t;
+    const fade = (1 - t) * (1 - t);
+    glow(cx, cy, radius, 1.0, 0.55, 0.12, 0.55 * fade);
+    glow(cx, cy, radius * 0.55, 1.0, 0.75, 0.30, 0.45 * fade);
+  }
+  // Flame flickers: small hot knots scattered along the tail.
+  const flickers = [
+    [0.12, 6, 0.8],
+    [0.24, -10, 0.65],
+    [0.36, 8, 0.55],
+    [0.48, -6, 0.45],
+    [0.60, 12, 0.35],
+    [0.72, -14, 0.25],
   ];
-  for (const s of streaks) {
-    const steps = Math.ceil(s.len / 2);
-    for (let i = 0; i <= steps; i++) {
-      const t = i / steps;
-      const x = s.x + TRAVEL_X * s.len * t;
-      const y = s.y + TRAVEL_Y * s.len * t;
-      const fade = Math.sin(t * Math.PI); // tapers both ends
-      img.add(x, y, [s.a * fade, s.a * fade * 0.85, s.a * fade * 0.6]);
-      img.add(x, y + 1, [s.a * fade * 0.5, s.a * fade * 0.4, s.a * fade * 0.3]);
+  for (const [t, off, peak] of flickers) {
+    const bend = 38 * t * t;
+    glow(hx + dx * 700 * t + bend * 0.25 + off, hy + dy * 700 * t + bend - off * 0.5, 30 + 40 * t, 1.0, 0.8, 0.35, peak);
+  }
+  // Bright core streak along the axis.
+  stroke(hx, hy, hx + dx * 620, hy + dy * 620 + 30, 26, 1.0, 0.85, 0.45, 0.55);
+  stroke(hx, hy, hx + dx * 420, hy + dy * 420 + 14, 12, 1.0, 0.95, 0.70, 0.7);
+  // Coma: the glowing head.
+  glow(hx, hy, 150, 1.0, 0.62, 0.18, 0.75);
+  glow(hx, hy, 95, 1.0, 0.80, 0.40, 0.85);
+  glow(hx, hy, 55, 1.0, 0.95, 0.70, 0.95);
+  // Distinct nucleus: a small white-hot disc with a thin bright ring.
+  disc(hx, hy, 21, 1.0, 1.0, 0.98);
+  disc(hx - 4, hy - 4, 12, 1.0, 1.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Surfer: a big dark silhouette standing ON the board, gold rim-light and a
+// flowing gold scarf drawn as a sampled Bezier ribbon. Board runs from
+// (560, 420) to (740, 350); feet land on it, hips at (655, 320).
+// ---------------------------------------------------------------------------
+const INK = [0.015, 0.015, 0.035]; // near-black silhouette
+const GOLD = [1.0, 0.78, 0.32];
+
+// Sample a quadratic Bezier curve.
+function bezier(p0, p1, p2, steps) {
+  const pts = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const u = 1 - t;
+    pts.push([
+      u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0],
+      u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1],
+    ]);
+  }
+  return pts;
+}
+
+// A tapering ribbon along a point list: width shrinks from w0 to w1.
+function ribbon(points, w0, w1, r, g, b, peak) {
+  for (let i = 0; i + 1 < points.length; i++) {
+    const t = i / (points.length - 1);
+    const w = w0 + (w1 - w0) * t;
+    stroke(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1], w, r, g, b, peak);
+  }
+}
+
+function paintSurfer() {
+  // Board: long plank tilted along the comet's path, gold edge on top.
+  fillPoly(
+    [
+      [558, 414],
+      [742, 344],
+      [744, 354],
+      [562, 424],
+    ],
+    INK[0],
+    INK[1],
+    INK[2],
+  );
+  stroke(560, 413, 742, 344, 2, GOLD[0], GOLD[1], GOLD[2], 0.9);
+
+  // Legs: bent knees, feet planted on the board.
+  strokeSolid(655, 322, 626, 366, 13, INK[0], INK[1], INK[2]); // back thigh
+  strokeSolid(626, 366, 610, 400, 12, INK[0], INK[1], INK[2]); // back shin
+  strokeSolid(655, 322, 684, 346, 13, INK[0], INK[1], INK[2]); // front thigh
+  strokeSolid(684, 346, 690, 368, 12, INK[0], INK[1], INK[2]); // front shin
+  // Torso: leaning forward toward the comet head.
+  fillPoly(
+    [
+      [648, 262],
+      [680, 268],
+      [668, 326],
+      [642, 322],
+    ],
+    INK[0],
+    INK[1],
+    INK[2],
+  );
+  // Backpack: rounded block behind the torso.
+  softEllipse(636, 288, 15, 24, INK[0], INK[1], INK[2], 1.0);
+  // Arms: front arm reaching toward the nose, back arm thrown up for balance.
+  strokeSolid(672, 276, 716, 312, 10, INK[0], INK[1], INK[2]);
+  strokeSolid(650, 272, 602, 244, 10, INK[0], INK[1], INK[2]);
+  // Helmet: round, with a gold visor slit catching the comet light.
+  disc(682, 248, 18, INK[0], INK[1], INK[2]);
+  stroke(674, 242, 694, 238, 3, GOLD[0], GOLD[1], GOLD[2], 0.95);
+  // Gold rim-light along the comet-facing edges.
+  stroke(680, 268, 668, 326, 3, GOLD[0], GOLD[1], GOLD[2], 0.85);
+  stroke(684, 346, 690, 368, 3, GOLD[0], GOLD[1], GOLD[2], 0.7);
+  stroke(682, 230, 698, 242, 3, GOLD[0], GOLD[1], GOLD[2], 0.9);
+  // Scarf: a gold ribbon streaming back from the neck, S-curved.
+  const scarf = bezier([658, 268], [580, 306], [500, 330], 14).concat(
+    bezier([500, 330], [470, 372], [452, 408], 10).slice(1),
+  );
+  ribbon(scarf, 14, 4, GOLD[0], GOLD[1], GOLD[2], 0.95);
+  ribbon(scarf, 5, 2, 1.0, 0.95, 0.65, 0.9);
+}
+
+// ---------------------------------------------------------------------------
+// Earth: a blue sphere low on the left, lit from the top right, with clouds
+// and a thin glowing atmosphere.
+// ---------------------------------------------------------------------------
+function paintEarth() {
+  const cx = 175;
+  const cy = 835;
+  const r = 128;
+  // Atmosphere halo first (additive, behind the disc).
+  glow(cx, cy, r + 26, 0.25, 0.55, 1.0, 0.30);
+  glow(cx, cy, r + 10, 0.35, 0.65, 1.0, 0.22);
+  // Ocean: shaded sphere, light from the top right.
+  const lx = 0.55;
+  const ly = -0.83;
+  for (let y = cy - r; y <= cy + r; y++) {
+    for (let x = cx - r; x <= cx + r; x++) {
+      const dx = (x + 0.5 - cx) / r;
+      const dy = (y + 0.5 - cy) / r;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > 1) continue;
+      const nz = Math.sqrt(1 - d2);
+      let light = 0.25 + 0.75 * Math.max(0, dx * lx + dy * ly + nz * 0.35);
+      const i = (y * W + x) * 3;
+      buf[i] = 0.05 * light + 0.02;
+      buf[i + 1] = 0.28 * light + 0.02;
+      buf[i + 2] = 0.62 * light + 0.04;
+    }
+  }
+  // Clouds: each cloud is a cluster of overlapping soft puffs, so none
+  // reads as a flat pill; slight blue tint so they sit on the ocean.
+  const clouds = [
+    [140, 800],
+    [200, 830],
+    [120, 860],
+    [215, 790],
+    [175, 880],
+  ];
+  for (const [ccx, ccy] of clouds) {
+    softEllipse(ccx - 16, ccy - 4, 26, 8, 0.88, 0.92, 1.0, 0.30);
+    softEllipse(ccx + 6, ccy + 2, 30, 9, 0.92, 0.95, 1.0, 0.32);
+    softEllipse(ccx + 22, ccy - 6, 20, 7, 0.88, 0.92, 1.0, 0.28);
+    softEllipse(ccx, ccy + 6, 24, 7, 0.95, 0.97, 1.0, 0.25);
+  }
+  // Limb darkening: a faint dark rim on the night side.
+  for (let a = 0; a < Math.PI * 2; a += 0.01) {
+    const x = cx + Math.cos(a) * (r - 2);
+    const y = cy + Math.sin(a) * (r - 2);
+    if (Math.cos(a) < -0.2 && Math.sin(a) > 0.1) {
+      put(Math.round(x), Math.round(y), -0.02, -0.02, -0.02);
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// SURFER: a small bold silhouette riding the comet's leading edge. The
-// figure is drawn twice — first a gold copy shifted toward the comet (the
-// light), then the dark figure on top, so the gold shows only as a rim on
-// the comet-facing side. The figure is deliberately simple: helmet,
-// torso, bent legs, outstretched arms, a backpack. No face, no fingers,
-// nothing to break at this size.
+// Caption "DON'T BLINK." in a 5x7 bitmap font, gold, bottom centre.
 // ---------------------------------------------------------------------------
-// Geometry, in frame coordinates. The board runs nose (549, 335) to tail
-// (635, 269); both feet sit exactly on that line.
-const BOARD_NOSE = { x: 549, y: 335 };
-const BOARD_TAIL = { x: 635, y: 269 };
-const FOOT_FRONT = { x: 575, y: 315 };
-const FOOT_BACK = { x: 613, y: 286 };
-const HIP = { x: 598, y: 266 };
-const SHOULDER = { x: 612, y: 236 };
-const HELMET = { x: 618, y: 222 };
-const PACK = { x: 588, y: 246 };
-const NECK = { x: 612, y: 230 };
-const INK: RGB = [0.012, 0.012, 0.03];
-const RIM: RGB = [1.5, 0.95, 0.35];
-
-function drawRider(ox: number, oy: number, c: RGB): void {
-  // Board: nose leads down-left along the direction of travel.
-  img.stroke(BOARD_NOSE.x + ox, BOARD_NOSE.y + oy, BOARD_TAIL.x + ox, BOARD_TAIL.y + oy, 11, c, true);
-  // Legs: bent surfing stance, feet planted on the board.
-  img.stroke(FOOT_BACK.x + ox, FOOT_BACK.y + oy, HIP.x + ox, HIP.y + oy, 11, c, true);
-  img.stroke(FOOT_FRONT.x + ox, FOOT_FRONT.y + oy, HIP.x + ox, HIP.y + oy, 11, c, true);
-  // Backpack: the one shape that says "astronaut" at this size.
-  img.blob(PACK.x + ox, PACK.y + oy, 10, c);
-  // Torso: leaning back toward the tail (up-right).
-  img.stroke(HIP.x + ox, HIP.y + oy, SHOULDER.x + ox, SHOULDER.y + oy, 16, c, true);
-  // Helmet.
-  img.blob(HELMET.x + ox, HELMET.y + oy, 12, c);
-  // Arms: front arm reaching down-left toward the nose, back arm up.
-  img.stroke(SHOULDER.x - 6 + ox, SHOULDER.y + 6 + oy, 570 + ox, 260 + oy, 9, c, true);
-  img.stroke(SHOULDER.x + 2 + ox, SHOULDER.y + 2 + oy, 650 + ox, 220 + oy, 9, c, true);
-}
-
-function drawScarf(): void {
-  // A gold scarf streaming up-right toward the tail, one smooth wave.
-  // It starts exactly at the neck, wide at the base so it reads as
-  // attached, and stays close to the figure.
-  for (let s = 0; s <= 26; s++) {
-    const t = s / 26;
-    const x = NECK.x + t * 88 + Math.sin(0.6 + 4.5 * t) * 6 * t;
-    const y = NECK.y - t * 64 + Math.cos(4.0 * t) * 5 * t;
-    const w = 12 * (1 - t * 0.6);
-    const fade = 1 - t * 0.45;
-    img.halo(x, y, w, [1.35 * fade, 0.8 * fade, 0.28 * fade], 3.4);
-  }
-}
-
-function paintSurfer(): void {
-  // Stardust trail off the board's tail: tiny gold dots arcing away.
-  for (let i = 0; i < 26; i++) {
-    const t = i / 25;
-    const x = 640 + t * 120 + Math.sin(5.2 * t) * 14;
-    const y = 265 - t * 96 + Math.cos(4.1 * t) * 10;
-    const m = (0.55 + rng.next() * 0.5) * (1 - t * 0.6);
-    img.add(x, y, [m, m * 0.7, m * 0.3]);
-    if (i % 3 === 0) img.add(x + 1, y, [m * 0.5, m * 0.35, m * 0.15]);
-  }
-  // Contact glow where the board meets the comet's fire.
-  img.halo(592, 302, 34, [1.1, 0.6, 0.18], 2.8);
-  // Rim-light copy, shifted toward the comet head (down-right).
-  drawRider(2.2, 2.2, RIM);
-  // The dark figure itself.
-  drawRider(0, 0, INK);
-  drawScarf();
-}
-
-// ---------------------------------------------------------------------------
-// CAPTION: "DON'T BLINK." in a clean 5x7 bitmap font, scale 3, warm white
-// with a soft glow underneath. Text aimed at the judge is part of the
-// game; this line talks back — short, confident, naming the one thing the
-// picture is doing. Glyphs are stored as seven 5-bit rows each.
-// ---------------------------------------------------------------------------
-const GLYPHS: Record<string, number[]> = {
-  B: [0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e],
+const FONT = {
   D: [0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e],
+  O: [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
+  N: [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+  "'": [0x04, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00],
+  T: [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+  ' ': [0, 0, 0, 0, 0, 0, 0],
+  B: [0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e],
+  L: [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f],
   I: [0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e],
   K: [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
-  L: [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f],
-  N: [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
-  O: [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
-  T: [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
-  "'": [0x04, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00],
-  '.': [0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06],
-  ' ': [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+  '.': [0, 0, 0, 0, 0, 0x0c, 0x0c],
 };
 
-function paintCaption(text: string, cx: number, y: number, scale: number): void {
-  const cell = 5 * scale + 3;
-  const totalW = text.length * cell - 3;
-  let x = Math.round(cx - totalW / 2);
+function drawText(text, cx, y, scale, r, g, b) {
+  const adv = 6 * scale;
+  const total = text.length * adv - scale;
+  let x = Math.round(cx - total / 2);
   for (const ch of text) {
-    const glyph = GLYPHS[ch] ?? GLYPHS[' '];
+    const glyph = FONT[ch] ?? FONT[' '];
     for (let row = 0; row < 7; row++) {
       const bits = glyph[row];
       for (let col = 0; col < 5; col++) {
-        if (((bits >> (4 - col)) & 1) === 0) continue;
-        const px = x + col * scale;
-        const py = y + row * scale;
-        // Soft glow first (bigger, dimmer), then the crisp pixel block.
-        img.halo(px + scale / 2, py + scale / 2, scale * 1.7, [0.3, 0.22, 0.1], 2.6);
-        for (let dy = 0; dy < scale; dy++) {
-          for (let dx = 0; dx < scale; dx++) {
-            img.add(px + dx, py + dy, [1.35, 1.15, 0.72]);
+        if (bits & (0x10 >> col)) {
+          for (let dy = 0; dy < scale; dy++) {
+            for (let dx = 0; dx < scale; dx++) {
+              put(x + col * scale + dx, y + row * scale + dy, r, g, b);
+            }
           }
         }
       }
     }
-    x += cell;
+    x += adv;
   }
 }
 
-// ---------------------------------------------------------------------------
-// FINISH: a gentle vignette to hold the eye in the middle, then a filmic
-// tone map (1 - exp(-v)) so highlights roll off instead of clipping.
-// No grain: per-pixel noise costs tens of kilobytes of PNG for nothing
-// the eye can see at this size.
-// ---------------------------------------------------------------------------
-const EXPOSURE = 1.15;
+function paintCaption() {
+  // Soft gold halo behind the letters, then the bright letters.
+  drawText("DON'T BLINK.", 512, 946, 4, 0.45, 0.30, 0.08);
+  drawText("DON'T BLINK.", 512, 946, 4, 1.0, 0.85, 0.45);
+}
 
-function renderToBytes(): Uint8Array {
-  for (let y = 0; y < SIZE; y++) {
-    const ny = (y / SIZE - 0.5) * 2;
-    for (let x = 0; x < SIZE; x++) {
-      const nx = (x / SIZE - 0.5) * 2;
-      const d2 = nx * nx + ny * ny;
-      const f = 1 - 0.2 * Math.max(0, d2 - 0.55);
-      const i = (y * SIZE + x) * 3;
-      img.px[i] *= f;
-      img.px[i + 1] *= f;
-      img.px[i + 2] *= f;
-    }
+// ---------------------------------------------------------------------------
+// PNG writer: CRC32, zlib deflate level 9, adaptive per-row filter.
+// ---------------------------------------------------------------------------
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
   }
-  const out = new Uint8Array(SIZE * SIZE * 3);
-  for (let i = 0; i < out.length; i++) {
-    const t = 1 - Math.exp(-img.px[i] * EXPOSURE);
-    out[i] = Math.round(clamp01(t) * 255);
+  return table;
+})();
+
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) {
+    c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
   }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function chunk(type, data) {
+  const out = Buffer.alloc(12 + data.length);
+  out.writeUInt32BE(data.length, 0);
+  out.write(type, 4, 'ascii');
+  data.copy(out, 8);
+  out.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type, 'ascii'), data])), 8 + data.length);
   return out;
 }
 
+function encodePNG() {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0);
+  ihdr.writeUInt32BE(H, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // colour type: truecolour RGB
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const raw = Buffer.alloc(H * (1 + W * 3));
+  const prev = Buffer.alloc(W * 3);
+  for (let y = 0; y < H; y++) {
+    const row = Buffer.alloc(W * 3);
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 3;
+      row[x * 3] = Math.max(0, Math.min(255, Math.round(buf[i] * 255)));
+      row[x * 3 + 1] = Math.max(0, Math.min(255, Math.round(buf[i + 1] * 255)));
+      row[x * 3 + 2] = Math.max(0, Math.min(255, Math.round(buf[i + 2] * 255)));
+    }
+    // Pick the cheapest of filters 0 (None), 1 (Sub), 2 (Up) for this row.
+    let bestFilter = 0;
+    let bestCost = Infinity;
+    let bestRow = row;
+    for (let f = 0; f <= 2; f++) {
+      const filtered = Buffer.alloc(W * 3);
+      let cost = 0;
+      for (let i = 0; i < W * 3; i++) {
+        let v = row[i];
+        if (f === 1) v = (v - (i >= 3 ? row[i - 3] : 0)) & 0xff;
+        if (f === 2) v = (v - prev[i]) & 0xff;
+        filtered[i] = v;
+        cost += v < 128 ? v : 256 - v;
+      }
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestFilter = f;
+        bestRow = filtered;
+      }
+    }
+    raw[y * (1 + W * 3)] = bestFilter;
+    bestRow.copy(raw, y * (1 + W * 3) + 1);
+    row.copy(prev);
+  }
+
+  const idat = deflateSync(raw, { level: 9 });
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', idat),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+  return png;
+}
+
 // ---------------------------------------------------------------------------
-// MAIN
+// Main: paint the scene, write entry.png.
 // ---------------------------------------------------------------------------
-function main(): void {
+function main() {
   paintSky();
   paintComet();
-  paintEarth();
-  paintStreaks();
   paintSurfer();
-  paintCaption("DON'T BLINK.", 512, 948, 3);
-  const png = toPng(renderToBytes());
-  const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-  fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(path.join(outDir, 'entry.png'), png);
+  paintEarth();
+  paintCaption();
+  const png = encodePNG();
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? 'out';
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(join(outDir, 'entry.png'), png);
 }
 
 main();
